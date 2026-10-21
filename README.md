@@ -40,7 +40,9 @@ In the `--ui` window:
 
 - **Open…** (⌘O) adds one or more images. Switch between them with the file
   menu or ⌘[ / ⌘]. Each image keeps its own crop, zoom and rotation; cell
-  size, page and labels apply to all of them.
+  size, page and labels apply to all of them. The ⊖ button (⌘⌫) takes the
+  current image off the list so Save All skips it; the file itself is not
+  touched.
 - Drag (or use the arrow keys) to move the crop.
 - Scroll, pinch or press `+`/`-` to zoom; **Fit** resets.
 - Use the rotate buttons for 90° turns and the slider to straighten (±45°).
