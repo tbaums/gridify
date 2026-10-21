@@ -24,15 +24,20 @@ Any directory on your `PATH` works in place of `~/.local/bin`.
 ```sh
 gridify photo.jpg          # PDF goes to the iCloud Drive root
 gridify --ui photo.jpg     # position the crop in a window first
+gridify --ui               # open the window, then pick one or more images
 ```
 
 In the `--ui` window:
 
+- **Open…** (⌘O) adds one or more images. Switch between them with the file
+  menu or ⌘[ / ⌘]. Each image keeps its own crop, zoom and rotation; cell
+  size, page and labels apply to all of them.
 - Drag (or use the arrow keys) to move the crop.
 - Scroll, pinch or press `+`/`-` to zoom; **Fit** resets.
 - Use the rotate buttons for 90° turns and the slider to straighten (±45°).
-- Choose the cell size, page size and labels; **Save PDF** (or Return)
-  writes the PDF and opens it in Preview.
+- Choose the cell size, page size and labels; **Save PDF** (Return or ⌘S)
+  writes the current image's PDF and opens it in Preview. **Save All** (⌥⌘S)
+  writes every open image and shows the PDFs in Finder.
 
 Options:
 
