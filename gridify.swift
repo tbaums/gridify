@@ -389,11 +389,20 @@ final class Controller: NSObject, NSApplicationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
 
-        addFiles(paths)
+        addFiles(paths + pending)
+        pending = []
         if docs.isEmpty { refresh(); openFiles() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    // Files dropped on the app icon or sent with "Open With". At launch these
+    // arrive before the window exists, so hold them until it does.
+    var pending: [String] = []
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        if window == nil { pending += filenames } else { addFiles(filenames) }
+        sender.reply(toOpenOrPrint: .success)
+    }
 
     // Load images and show the first new one. Already-open paths are just selected.
     func addFiles(_ ps: [String]) {
@@ -564,7 +573,11 @@ func num(_ flag: String) -> Double {
     guard let s = argv.next(), let v = Double(s) else { die("\(flag) needs a number") }
     return v
 }
+// Launched as gridify.app (Finder, Dock): always the UI. Ignore the
+// -psn_ argument older macOS versions pass to apps.
+if Bundle.main.bundleURL.pathExtension == "app" { ui = true }
 while let a = argv.next() {
+    if a.hasPrefix("-psn_") { continue }
     switch a {
     case "-h", "--help": print(usage); exit(0)
     case "--ui": ui = true

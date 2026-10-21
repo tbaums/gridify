@@ -19,6 +19,15 @@ swiftc -O gridify/gridify.swift -o ~/.local/bin/gridify
 
 Any directory on your `PATH` works in place of `~/.local/bin`.
 
+To get a clickable app in `/Applications` as well:
+
+```sh
+gridify/scripts/make-app.sh            # or pass another folder
+```
+
+Double-click gridify.app to open the window, drop images on its icon, or use
+**Open With → gridify** on a photo in Finder.
+
 ## Use
 
 ```sh
