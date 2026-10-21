@@ -7,10 +7,13 @@ import CoreGraphics
 import CoreText
 import Foundation
 import ImageIO
+import UniformTypeIdentifiers
 
 let usage = """
 usage: gridify IMAGE... [options]
-  --ui               open a window to drag/zoom the crop, then Save (one image)
+       gridify --ui [IMAGE...] [options]
+  --ui               open a window to drag/zoom/rotate crops, then Save
+                     (images optional; open more with ⌘O)
   -o, --out PATH     output PDF (one image only; default: iCloud Drive/<name>_grid.pdf)
   --width IN         print width, inches (default 5)
   --height IN        print height, inches (default 7)
@@ -296,122 +299,248 @@ final class CropView: NSView {
     }
 }
 
-final class Controller: NSObject, NSApplicationDelegate {
-    let path: String, dest: URL
+// One open image: its own crop, zoom and rotation.
+struct Doc {
+    let path: String
+    let dest: URL
     let view: CropView
-    let status = NSTextField(labelWithString: "")
+}
+
+final class Controller: NSObject, NSApplicationDelegate {
+    let paths: [String], out: URL?
+    var opts: Opts  // shared: print size, cell, page, labels (rotation is per image)
+    var docs: [Doc] = []
+    var current = -1
+    var view: CropView? { current >= 0 ? docs[current].view : nil }
+
     var window: NSWindow!
+    var root: NSStackView!
+    let status = NSTextField(labelWithString: "")
+    let files = NSPopUpButton()
+    let placeholder = NSTextField(labelWithString: "Open one or more images with ⌘O")
+    let save = NSButton(title: "Save PDF", target: nil, action: nil)
+    let saveAll = NSButton(title: "Save All", target: nil, action: nil)
     let cells = [1.0, 0.5, 0.25]
     let fine = NSSlider()
     var quarter = 0.0  // 90° turns; total rotation = quarter * 90 + fine
+    var rotateControls: [NSControl] = []
 
-    init(path: String, img: CGImage, opts: Opts, dest: URL) {
-        self.path = path
-        self.dest = dest
-        view = CropView(img: img, opts: opts)
+    init(paths: [String], opts: Opts, out: URL?) {
+        self.paths = paths
+        self.opts = opts
+        self.out = out
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        let open = NSButton(title: "Open…", target: self, action: #selector(openFiles))
+        files.target = self; files.action = #selector(fileChanged)
+        files.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        save.target = self; save.action = #selector(saveCurrent)
+        save.keyEquivalent = "\r"
+        saveAll.target = self; saveAll.action = #selector(saveEverything)
+        status.lineBreakMode = .byTruncatingMiddle
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let top = NSStackView(views: [open, files, status, saveAll, save])
+
         let cell = NSPopUpButton(title: "", target: self, action: #selector(cellChanged))
         cell.addItems(withTitles: ["1 in cells", "½ in cells", "¼ in cells"])
-        if let i = cells.firstIndex(of: view.opts.cell) { cell.selectItem(at: i) } else {
-            cell.addItem(withTitle: "\(view.opts.cell) in cells"); cell.selectItem(at: 3)
+        if let i = cells.firstIndex(of: opts.cell) { cell.selectItem(at: i) } else {
+            cell.addItem(withTitle: "\(opts.cell) in cells"); cell.selectItem(at: 3)
         }
         let page = NSPopUpButton(title: "", target: self, action: #selector(pageChanged))
         page.addItems(withTitles: ["letter", "a4"])
-        page.selectItem(withTitle: view.opts.page)
+        page.selectItem(withTitle: opts.page)
         let labels = NSButton(checkboxWithTitle: "Labels", target: self, action: #selector(labelsChanged))
-        labels.state = view.opts.labels ? .on : .off
+        labels.state = opts.labels ? .on : .off
         let reset = NSButton(title: "Fit", target: self, action: #selector(resetZoom))
-        quarter = (view.opts.rotate / 90).rounded()
         fine.minValue = -45; fine.maxValue = 45
-        fine.doubleValue = view.opts.rotate - quarter * 90
         fine.isContinuous = true
         fine.target = self; fine.action = #selector(fineChanged)
         fine.toolTip = "straighten (±45°)"
-        fine.widthAnchor.constraint(equalToConstant: 110).isActive = true
+        fine.widthAnchor.constraint(equalToConstant: 140).isActive = true
         let ccw = NSButton(image: NSImage(systemSymbolName: "rotate.left", accessibilityDescription: "Rotate left")!,
                            target: self, action: #selector(turnLeft))
         let cw = NSButton(image: NSImage(systemSymbolName: "rotate.right", accessibilityDescription: "Rotate right")!,
                           target: self, action: #selector(turnRight))
         ccw.toolTip = "rotate 90° left"; cw.toolTip = "rotate 90° right"
-        let save = NSButton(title: "Save PDF", target: self, action: #selector(save))
-        save.keyEquivalent = "\r"
-        status.lineBreakMode = .byTruncatingMiddle
-        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        rotateControls = [reset, ccw, cw, fine]
+        let bottom = NSStackView(views: [cell, page, labels, reset, ccw, cw, fine])
+        for bar in [top, bottom] {
+            bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+            bar.setHuggingPriority(.defaultLow, for: .horizontal)
+        }
 
-        let bar = NSStackView(views: [cell, page, labels, reset, ccw, cw, fine, status, save])
-        bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        bar.setHuggingPriority(.defaultLow, for: .horizontal)
-        let root = NSStackView(views: [view, bar])
+        // Empty state: a size-less container so the bars stay pinned top and bottom.
+        let empty = NSView()
+        placeholder.textColor = .secondaryLabelColor
+        placeholder.translatesAutoresizingMaskIntoConstraints = false
+        empty.addSubview(placeholder)
+        placeholder.centerXAnchor.constraint(equalTo: empty.centerXAnchor).isActive = true
+        placeholder.centerYAnchor.constraint(equalTo: empty.centerYAnchor).isActive = true
+        empty.setContentHuggingPriority(.defaultLow, for: .vertical)
+        root = NSStackView(views: [top, empty, bottom])
         root.orientation = .vertical
         root.spacing = 0
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 820),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 860),
                           styleMask: [.titled, .closable, .resizable, .miniaturizable],
                           backing: .buffered, defer: false)
-        window.title = "gridify — \(URL(fileURLWithPath: path).lastPathComponent)"
         window.contentView = root
         window.center()
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(view)
-        view.onChange = { [weak self] in self?.updateStatus() }
-        updateStatus()
+
+        addFiles(paths)
+        if docs.isEmpty { refresh(); openFiles() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
+    // Load images and show the first new one. Already-open paths are just selected.
+    func addFiles(_ ps: [String]) {
+        var first: Int?, errors: [String] = []
+        for p in ps {
+            let full = URL(fileURLWithPath: p).standardizedFileURL.path
+            if let i = docs.firstIndex(where: { $0.path == full }) { first = first ?? i; continue }
+            do {
+                let v = CropView(img: try loadOriented(full), opts: opts)
+                v.onChange = { [weak self] in self?.updateStatus() }
+                let dest = (out != nil && paths.count == 1 && docs.isEmpty) ? out! : defaultDest(full)
+                docs.append(Doc(path: full, dest: dest, view: v))
+                first = first ?? docs.count - 1
+            } catch let e as Fail {
+                errors.append(e.msg)
+            } catch {
+                errors.append("\(error)")
+            }
+        }
+        if let i = first { select(i) } else { refresh() }
+        if !errors.isEmpty { updateStatus("error: " + errors.joined(separator: "; ")) }
+    }
+
+    func select(_ i: Int) {
+        let old = root.arrangedSubviews[1]
+        root.removeArrangedSubview(old)
+        old.removeFromSuperview()
+        current = i
+        let v = docs[i].view
+        v.opts.cell = opts.cell; v.opts.page = opts.page; v.opts.labels = opts.labels
+        root.insertArrangedSubview(v, at: 1)
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        v.setContentHuggingPriority(.defaultLow, for: .vertical)
+        quarter = (v.opts.rotate / 90).rounded()
+        fine.doubleValue = v.opts.rotate - quarter * 90
+        window.makeFirstResponder(v)
+        v.needsDisplay = true
+        refresh()
+    }
+
+    // Sync the file menu, title, button state and status with the current doc.
+    func refresh() {
+        files.removeAllItems()
+        files.addItems(withTitles: docs.enumerated().map { "\($0.offset + 1). \(URL(fileURLWithPath: $0.element.path).lastPathComponent)" })
+        files.isHidden = docs.isEmpty
+        if current >= 0 { files.selectItem(at: current) }
+        window.title = view.map { _ in "gridify — \(URL(fileURLWithPath: docs[current].path).lastPathComponent)" } ?? "gridify"
+        save.isEnabled = view != nil
+        saveAll.isHidden = docs.count < 2
+        for c in rotateControls { c.isEnabled = view != nil }
+        updateStatus()
+    }
+
     func updateStatus(_ prefix: String = "") {
-        let ppi = view.crop.width / view.opts.width
+        guard let v = view else { status.stringValue = prefix; return }
+        let ppi = v.crop.width / v.opts.width
         let warn = ppi < 180 ? " — low-res, expect softness" : ""
         status.stringValue = prefix.isEmpty
-            ? String(format: "%.1f° · %.0f px/in%@", view.opts.rotate, ppi, warn)
+            ? String(format: "%.1f° · %.0f px/in%@", v.opts.rotate, ppi, warn)
             : prefix
     }
+
+    @objc func openFiles() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image]
+        panel.message = "Choose images to grid"
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            if resp == .OK { self?.addFiles(panel.urls.map(\.path)) }
+        }
+    }
+    @objc func fileChanged(_ s: NSPopUpButton) { if s.indexOfSelectedItem >= 0 { select(s.indexOfSelectedItem) } }
+    @objc func nextFile() { if docs.count > 1 { select((current + 1) % docs.count) } }
+    @objc func prevFile() { if docs.count > 1 { select((current + docs.count - 1) % docs.count) } }
 
     func applyRotation() {
         let deg = (quarter * 90 + (fine.doubleValue * 10).rounded() / 10)
             .truncatingRemainder(dividingBy: 360)
-        view.setRotation(deg < 0 ? deg + 360 : deg)
+        view?.setRotation(deg < 0 ? deg + 360 : deg)
     }
     @objc func fineChanged() { applyRotation() }
     @objc func turnLeft() { quarter -= 1; applyRotation() }
     @objc func turnRight() { quarter += 1; applyRotation() }
 
-    @objc func cellChanged(_ s: NSPopUpButton) {
-        if s.indexOfSelectedItem < cells.count { view.opts.cell = cells[s.indexOfSelectedItem] }
-        view.needsDisplay = true
+    // Shared settings apply to every open image.
+    func setShared(_ f: (inout Opts) -> Void) {
+        f(&opts)
+        for d in docs { f(&d.view.opts); d.view.needsDisplay = true }
     }
-    @objc func pageChanged(_ s: NSPopUpButton) { view.opts.page = s.titleOfSelectedItem ?? "letter" }
-    @objc func labelsChanged(_ s: NSButton) { view.opts.labels = s.state == .on }
-    @objc func resetZoom() { view.setZoom(1) }
-    @objc func save() {
+    @objc func cellChanged(_ s: NSPopUpButton) {
+        if s.indexOfSelectedItem < cells.count { let c = cells[s.indexOfSelectedItem]; setShared { $0.cell = c } }
+    }
+    @objc func pageChanged(_ s: NSPopUpButton) { let p = s.titleOfSelectedItem ?? "letter"; setShared { $0.page = p } }
+    @objc func labelsChanged(_ s: NSButton) { let on = s.state == .on; setShared { $0.labels = on } }
+    @objc func resetZoom() { view?.setZoom(1) }
+
+    func write(_ d: Doc) throws -> String {
+        let msg = try render(d.view.img, crop: d.view.crop, d.view.opts, to: d.dest)
+        print(msg)
+        return msg
+    }
+    @objc func saveCurrent() {
+        guard current >= 0 else { return }
+        let d = docs[current]
         do {
-            let msg = try render(view.img, crop: view.crop, view.opts, to: dest)
-            print(msg)
-            updateStatus("saved \(dest.lastPathComponent) to \(dest.deletingLastPathComponent().lastPathComponent)")
-            NSWorkspace.shared.open(dest)
-        } catch let e as Fail {
-            updateStatus("error: \(e.msg)")
-        } catch {
-            updateStatus("error: \(error)")
+            _ = try write(d)
+            updateStatus("saved \(d.dest.lastPathComponent) to \(d.dest.deletingLastPathComponent().lastPathComponent)")
+            NSWorkspace.shared.open(d.dest)
+        } catch let e as Fail { updateStatus("error: \(e.msg)") } catch { updateStatus("error: \(error)") }
+    }
+    @objc func saveEverything() {
+        var saved: [URL] = [], errors: [String] = []
+        for d in docs {
+            do { _ = try write(d); saved.append(d.dest) } catch let e as Fail { errors.append(e.msg) } catch {
+                errors.append("\(error)")
+            }
         }
+        updateStatus(errors.isEmpty ? "saved \(saved.count) PDFs" : "saved \(saved.count); error: " + errors.joined(separator: "; "))
+        if !saved.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(saved) }
     }
 }
 
-func runUI(_ path: String, _ o: Opts, dest: URL) -> Never {
-    let img: CGImage
-    do { img = try loadOriented(path) } catch let e as Fail { die(e.msg) } catch { die("\(error)") }
+func runUI(_ paths: [String], _ o: Opts, out: URL?) -> Never {
     let app = NSApplication.shared
-    let controller = Controller(path: path, img: img, opts: o, dest: dest)
+    let controller = Controller(paths: paths, opts: o, out: out)
     app.delegate = controller
-    let menu = NSMenu(), appItem = NSMenuItem()
-    menu.addItem(appItem)
+    let menu = NSMenu()
+    let appItem = NSMenuItem(), fileItem = NSMenuItem()
+    menu.addItem(appItem); menu.addItem(fileItem)
     appItem.submenu = NSMenu()
     appItem.submenu!.addItem(withTitle: "Quit gridify", action: #selector(NSApplication.terminate(_:)),
                              keyEquivalent: "q")
+    let file = NSMenu(title: "File")
+    for (title, sel, key, mods) in [
+        ("Open…", #selector(Controller.openFiles), "o", NSEvent.ModifierFlags.command),
+        ("Save PDF", #selector(Controller.saveCurrent), "s", .command),
+        ("Save All", #selector(Controller.saveEverything), "s", [.command, .option]),
+        ("Next Image", #selector(Controller.nextFile), "]", .command),
+        ("Previous Image", #selector(Controller.prevFile), "[", .command),
+    ] {
+        let item = file.addItem(withTitle: title, action: sel, keyEquivalent: key)
+        item.keyEquivalentModifierMask = mods
+        item.target = controller
+    }
+    fileItem.submenu = file
     app.mainMenu = menu
     app.setActivationPolicy(.regular)
     app.activate(ignoringOtherApps: true)
@@ -453,14 +582,14 @@ while let a = argv.next() {
         images.append(a)
     }
 }
-if images.isEmpty { die(usage) }
-if (out != nil || ui) && images.count > 1 { die("--out and --ui work with one image only") }
+if images.isEmpty && !ui { die(usage) }
+if out != nil && images.count > 1 { die("--out works with one image only") }
 if o.width <= 0 || o.height <= 0 || o.cell <= 0 || !(0...1).contains(o.fx) || !(0...1).contains(o.fy) {
     die("sizes must be > 0 and --focus-x/-y within 0..1")
 }
 if pages[o.page] == nil { die("--page must be letter or a4") }
 
-if ui { runUI(images[0], o, dest: out.map { URL(fileURLWithPath: $0) } ?? defaultDest(images[0])) }
+if ui { runUI(images, o, out: out.map { URL(fileURLWithPath: $0) }) }
 
 for p in images {
     do {
