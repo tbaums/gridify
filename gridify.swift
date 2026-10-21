@@ -318,6 +318,12 @@ final class Controller: NSObject, NSApplicationDelegate {
     let status = NSTextField(labelWithString: "")
     let files = NSPopUpButton()
     let placeholder = NSTextField(labelWithString: "Open one or more images with ⌘O")
+    let empty = NSView()
+    let remove = NSButton(image: NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "Remove image")!,
+                          target: nil, action: nil)
+    // After saving: open the PDF / reveal PDFs. Swappable so tests stay off screen.
+    var openPDF: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    var reveal: ([URL]) -> Void = { NSWorkspace.shared.activateFileViewerSelecting($0) }
     let save = NSButton(title: "Save PDF", target: nil, action: nil)
     let saveAll = NSButton(title: "Save All", target: nil, action: nil)
     let cells = [1.0, 0.5, 0.25]
@@ -332,7 +338,17 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        buildWindow()
+        window.makeKeyAndOrderFront(nil)
+        addFiles(paths + pending)
+        pending = []
+        if docs.isEmpty { refresh(); openFiles() }
+    }
+
+    func buildWindow() {
         let open = NSButton(title: "Open…", target: self, action: #selector(openFiles))
+        remove.target = self; remove.action = #selector(removeCurrent)
+        remove.toolTip = "remove this image from the list (the file is not deleted)"
         files.target = self; files.action = #selector(fileChanged)
         files.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         save.target = self; save.action = #selector(saveCurrent)
@@ -340,7 +356,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         saveAll.target = self; saveAll.action = #selector(saveEverything)
         status.lineBreakMode = .byTruncatingMiddle
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [open, files, status, saveAll, save])
+        let top = NSStackView(views: [open, files, remove, status, saveAll, save])
 
         let cell = NSPopUpButton(title: "", target: self, action: #selector(cellChanged))
         cell.addItems(withTitles: ["1 in cells", "½ in cells", "¼ in cells"])
@@ -371,7 +387,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         // Empty state: a size-less container so the bars stay pinned top and bottom.
-        let empty = NSView()
         placeholder.textColor = .secondaryLabelColor
         placeholder.translatesAutoresizingMaskIntoConstraints = false
         empty.addSubview(placeholder)
@@ -387,11 +402,6 @@ final class Controller: NSObject, NSApplicationDelegate {
                           backing: .buffered, defer: false)
         window.contentView = root
         window.center()
-        window.makeKeyAndOrderFront(nil)
-
-        addFiles(paths + pending)
-        pending = []
-        if docs.isEmpty { refresh(); openFiles() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
@@ -426,14 +436,19 @@ final class Controller: NSObject, NSApplicationDelegate {
         if !errors.isEmpty { updateStatus("error: " + errors.joined(separator: "; ")) }
     }
 
-    func select(_ i: Int) {
+    // Replace the middle of the window (image view or empty state).
+    func showContent(_ v: NSView) {
         let old = root.arrangedSubviews[1]
         root.removeArrangedSubview(old)
         old.removeFromSuperview()
+        root.insertArrangedSubview(v, at: 1)
+    }
+
+    func select(_ i: Int) {
         current = i
         let v = docs[i].view
         v.opts.cell = opts.cell; v.opts.page = opts.page; v.opts.labels = opts.labels
-        root.insertArrangedSubview(v, at: 1)
+        showContent(v)
         v.translatesAutoresizingMaskIntoConstraints = false
         v.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         v.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -449,6 +464,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         files.removeAllItems()
         files.addItems(withTitles: docs.enumerated().map { "\($0.offset + 1). \(URL(fileURLWithPath: $0.element.path).lastPathComponent)" })
         files.isHidden = docs.isEmpty
+        remove.isHidden = docs.isEmpty
         if current >= 0 { files.selectItem(at: current) }
         window.title = view.map { _ in "gridify — \(URL(fileURLWithPath: docs[current].path).lastPathComponent)" } ?? "gridify"
         save.isEnabled = view != nil
@@ -479,6 +495,19 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc func fileChanged(_ s: NSPopUpButton) { if s.indexOfSelectedItem >= 0 { select(s.indexOfSelectedItem) } }
     @objc func nextFile() { if docs.count > 1 { select((current + 1) % docs.count) } }
     @objc func prevFile() { if docs.count > 1 { select((current + docs.count - 1) % docs.count) } }
+
+    // Drop the current image from the list (not from disk); show the next one.
+    @objc func removeCurrent() {
+        guard current >= 0 else { return }
+        docs.remove(at: current)
+        if docs.isEmpty {
+            current = -1
+            showContent(empty)
+            refresh()
+        } else {
+            select(min(current, docs.count - 1))
+        }
+    }
 
     func applyRotation() {
         let deg = (quarter * 90 + (fine.doubleValue * 10).rounded() / 10)
@@ -512,7 +541,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         do {
             _ = try write(d)
             updateStatus("saved \(d.dest.lastPathComponent) to \(d.dest.deletingLastPathComponent().lastPathComponent)")
-            NSWorkspace.shared.open(d.dest)
+            openPDF(d.dest)
         } catch let e as Fail { updateStatus("error: \(e.msg)") } catch { updateStatus("error: \(error)") }
     }
     @objc func saveEverything() {
@@ -523,7 +552,7 @@ final class Controller: NSObject, NSApplicationDelegate {
             }
         }
         updateStatus(errors.isEmpty ? "saved \(saved.count) PDFs" : "saved \(saved.count); error: " + errors.joined(separator: "; "))
-        if !saved.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(saved) }
+        if !saved.isEmpty { reveal(saved) }
     }
 }
 
@@ -544,6 +573,7 @@ func runUI(_ paths: [String], _ o: Opts, out: URL?) -> Never {
         ("Save All", #selector(Controller.saveEverything), "s", [.command, .option]),
         ("Next Image", #selector(Controller.nextFile), "]", .command),
         ("Previous Image", #selector(Controller.prevFile), "[", .command),
+        ("Remove Image", #selector(Controller.removeCurrent), "\u{8}", .command),
     ] {
         let item = file.addItem(withTitle: title, action: sel, keyEquivalent: key)
         item.keyEquivalentModifierMask = mods
