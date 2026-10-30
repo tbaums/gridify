@@ -46,6 +46,15 @@ In the `--ui` window:
 - Drag (or use the arrow keys) to move the crop.
 - Scroll, pinch or press `+`/`-` to zoom; **Fit** resets.
 - Use the rotate buttons for 90° turns and the slider to straighten (±45°).
+- The bottom row adjusts the photo for drawing. Each image keeps its own
+  settings, and the preview and the PDF match:
+  - **Auto** (on by default): stretches darks and lights to the full range and
+    lifts a dark photo's midtones.
+  - **B&W**: black and white.
+  - **Steps** 3/4/5: simplifies to a few flat tones, a value map for blocking
+    in shadows.
+  - **Bright / Contrast / Shadows / Highlights** sliders fine-tune it.
+  - **Reset** goes back to the defaults.
 - **≤ 2 MB** (on by default, remembered) shrinks the photo so each PDF is 2 MB
   or less: JPEG quality first, then resolution. The grid stays sharp vector.
 - Choose the cell size, page size and labels; **Save PDF** (Return or ⌘S)
@@ -64,6 +73,11 @@ Options:
 | `--page letter\|a4` | letter | page size |
 | `--labels` | off | label columns A… and rows 1… |
 | `--no-max-2mb` | capped | allow PDFs over 2 MB (`--max-2mb` caps) |
+| `--no-auto` | auto on | skip auto-contrast |
+| `--gray` | off | black and white |
+| `--steps 3\|4\|5` | off | value map with N tones (implies `--gray`) |
+| `--brightness`, `--contrast X` | 0 | -1..1 |
+| `--shadows`, `--highlights X` | 0 | 0..1 |
 
 The output prints the PDF size and effective resolution, and gridify warns when
 the photo is below 100 px per inch at the chosen print size. That's plenty for a
