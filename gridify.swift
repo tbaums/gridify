@@ -24,6 +24,8 @@ usage: gridify IMAGE... [options]
   --page letter|a4   page size (default letter)
   --labels           label columns A.. and rows 1..
   --rotate DEG       rotate the image clockwise before cropping (any angle)
+  --combine          with several images, also write one PDF of them all
+                     (one page each) as gridify_<date-time>.pdf
   --no-max-2mb       don't cap the PDF size (default: shrink the photo so
                      each PDF is 2 MB or less; --max-2mb turns it back on)
  drawing adjustments (auto-contrast is on unless --no-auto):
@@ -206,54 +208,82 @@ func jpegBacked(_ img: CGImage, quality: Double) -> CGImage? {
     return CGImage(jpegDataProviderSource: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
 }
 
-// Under the cap: lower JPEG quality first, then resolution, until the PDF fits.
-// Returns the PDF and the effective resolution of the embedded photo.
-func fittedPDF(_ cropped: CGImage, _ o: Opts) throws -> (Data, Double) {
-    var w = Double(cropped.width), h = Double(cropped.height)
-    while true {
-        guard let base = scaled(cropped, Int(w), Int(h)) else { throw Fail(msg: "resample failed") }
-        for q in [0.9, 0.8, 0.7, 0.6] {
-            guard let jpg = jpegBacked(base, quality: q) else { throw Fail(msg: "JPEG encode failed") }
-            let data = try pdfData(jpg, o)
-            if data.count <= o.maxBytes || w < 100 { return (data, w / o.width) }
-        }
-        w *= 0.8; h *= 0.8
-    }
-}
+// One image ready to place: cropped, adjusted and, under the cap, shrunk
+// (JPEG quality first, then resolution) until its one-page PDF fits.
+struct Page { let image: CGImage; let opts: Opts; let ppi: Double }
 
-func render(_ img: CGImage, crop: CGRect, _ o: Opts, to dest: URL) throws -> String {
+func preparePage(_ img: CGImage, crop: CGRect, _ o: Opts) throws -> Page {
     guard let (pw, ph) = pages[o.page] else { throw Fail(msg: "--page must be letter or a4") }
     if o.width > pw - 1 || o.height > ph - 1 {
         throw Fail(msg: "\(o.width)x\(o.height) in does not fit on \(o.page) with 0.5 in margins")
     }
     guard let raw = img.cropping(to: crop.integral) else { throw Fail(msg: "crop failed") }
     let cropped = adjusted(raw, o.adjust, autoLevels(img))
-    let (data, ppi) = o.maxBytes > 0
-        ? try fittedPDF(cropped, o)
-        : (try pdfData(cropped, o), Double(cropped.width) / o.width)
+    if o.maxBytes <= 0 { return Page(image: cropped, opts: o, ppi: Double(cropped.width) / o.width) }
+    var w = Double(cropped.width), h = Double(cropped.height)
+    while true {
+        guard let base = scaled(cropped, Int(w), Int(h)) else { throw Fail(msg: "resample failed") }
+        for q in [0.9, 0.8, 0.7, 0.6] {
+            guard let jpg = jpegBacked(base, quality: q) else { throw Fail(msg: "JPEG encode failed") }
+            if try pdfData([(jpg, o)]).count <= o.maxBytes || w < 100 {
+                return Page(image: jpg, opts: o, ppi: w / o.width)
+            }
+        }
+        w *= 0.8; h *= 0.8
+    }
+}
+
+func render(_ img: CGImage, crop: CGRect, _ o: Opts, to dest: URL) throws -> String {
+    try writePage(try preparePage(img, crop: crop, o), to: dest)
+}
+
+func writePage(_ p: Page, to dest: URL) throws -> String {
+    let o = p.opts
+    let data = try pdfData([(p.image, o)])
     do { try data.write(to: dest, options: .atomic) } catch { throw Fail(msg: "cannot write \(dest.path)") }
     let cols = gridPositions(o.width, o.cell).count + 1, rows = gridPositions(o.height, o.cell).count + 1
-    let size = String(format: "%.2f MB, %.0f px/in", Double(data.count) / 1e6, ppi)
-    let warn = ppi < softPPI ? " — low-res, expect softness" : ""
+    let size = String(format: "%.2f MB, %.0f px/in", Double(data.count) / 1e6, p.ppi)
+    let warn = p.ppi < softPPI ? " — low-res, expect softness" : ""
     return "saved: \(dest.path)  (\(cols) columns x \(rows) rows; \(size)\(warn))"
 }
 
-// The page: photo, vector grid, labels and margin ticks, as PDF bytes.
-func pdfData(_ cropped: CGImage, _ o: Opts) throws -> Data {
+// Several images as one PDF, one page each (each page within the cap).
+func writeCombined(_ ps: [Page], to dest: URL) throws -> String {
+    let data = try pdfData(ps.map { ($0.image, $0.opts) })
+    do { try data.write(to: dest, options: .atomic) } catch { throw Fail(msg: "cannot write \(dest.path)") }
+    return String(format: "saved: %@  (%d pages; %.2f MB)", dest.path, ps.count, Double(data.count) / 1e6)
+}
+
+// Combined file name: gridify_<date-time>.pdf next to the first per-image PDF.
+func combinedDest(near first: URL, at date: Date = Date()) -> URL {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd_HHmm"
+    return first.deletingLastPathComponent().appendingPathComponent("gridify_\(f.string(from: date)).pdf")
+}
+
+// Pages (photo, vector grid, labels, margin ticks) as PDF bytes.
+func pdfData(_ pageList: [(CGImage, Opts)]) throws -> Data {
+    let out = NSMutableData()
+    var first = CGRect(x: 0, y: 0, width: 612, height: 792)
+    guard let consumer = CGDataConsumer(data: out),
+          let ctx = CGContext(consumer: consumer, mediaBox: &first, nil) else {
+        throw Fail(msg: "cannot create PDF")
+    }
+    for (img, o) in pageList { drawPage(ctx, img, o) }
+    ctx.closePDF()
+    return out as Data
+}
+
+func drawPage(_ ctx: CGContext, _ cropped: CGImage, _ o: Opts) {
     let (pw, ph) = pages[o.page]!
     // PDF space: 72 pt/in, origin bottom-left.
     var media = CGRect(x: 0, y: 0, width: pw * 72, height: ph * 72)
-    let out = NSMutableData()
-    guard let consumer = CGDataConsumer(data: out),
-          let ctx = CGContext(consumer: consumer, mediaBox: &media, nil) else {
-        throw Fail(msg: "cannot create PDF")
-    }
     let W = o.width * 72, H = o.height * 72
     let ox = (media.width - W) / 2, oy = (media.height - H) / 2
     let xs = gridPositions(o.width, o.cell).map { $0 * 72 }
     let ys = gridPositions(o.height, o.cell).map { $0 * 72 }  // measured from the top
 
-    ctx.beginPDFPage(nil)
+    let box = NSData(bytes: &media, length: MemoryLayout<CGRect>.size)
+    ctx.beginPDFPage([kCGPDFContextMediaBox: box] as CFDictionary)
     ctx.setFillColor(CGColor(gray: 1, alpha: 1))
     ctx.fill(media)
     ctx.interpolationQuality = .high
@@ -304,8 +334,6 @@ func pdfData(_ cropped: CGImage, _ o: Opts) throws -> Data {
         stroke(CGPoint(x: ox + W + gap, y: oy + H - y), CGPoint(x: ox + W + tick, y: oy + H - y), black, 0.5)
     }
     ctx.endPDFPage()
-    ctx.closePDF()
-    return out as Data
 }
 
 // MARK: - UI
@@ -485,6 +513,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     var reveal: ([URL]) -> Void = { NSWorkspace.shared.activateFileViewerSelecting($0) }
     let save = NSButton(title: "Save PDF", target: nil, action: nil)
     let saveAll = NSButton(title: "Save All", target: nil, action: nil)
+    let combine = NSButton(checkboxWithTitle: "Combine", target: nil, action: nil)
     let cells = [1.0, 0.5, 0.25]
     let fine = NSSlider()
     var quarter = 0.0  // 90° turns; total rotation = quarter * 90 + fine
@@ -522,9 +551,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         save.target = self; save.action = #selector(saveCurrent)
         save.keyEquivalent = "\r"
         saveAll.target = self; saveAll.action = #selector(saveEverything)
+        combine.target = self; combine.action = #selector(combineChanged)
+        combine.state = (prefs.object(forKey: combineKey) as? Bool ?? true) ? .on : .off
+        combine.toolTip = "Save All also writes one PDF with every image, one per page, for printing in one go"
         status.lineBreakMode = .byTruncatingMiddle
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let top = NSStackView(views: [open, files, remove, status, saveAll, save])
+        let top = NSStackView(views: [open, files, remove, status, combine, saveAll, save])
 
         let cell = NSPopUpButton(title: "", target: self, action: #selector(cellChanged))
         cell.addItems(withTitles: ["1 in cells", "½ in cells", "¼ in cells"])
@@ -664,6 +696,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         window.title = view.map { _ in "gridify — \(URL(fileURLWithPath: docs[current].path).lastPathComponent)" } ?? "gridify"
         save.isEnabled = view != nil
         saveAll.isHidden = docs.count < 2
+        combine.isHidden = docs.count < 2
         for c in rotateControls { c.isEnabled = view != nil }
         updateStatus()
     }
@@ -770,21 +803,35 @@ final class Controller: NSObject, NSApplicationDelegate {
             openPDF(d.dest)
         } catch let e as Fail { updateStatus("error: \(e.msg)") } catch { updateStatus("error: \(error)") }
     }
+    // Every image to its own PDF; with Combine on, also one PDF of all of them.
     @objc func saveEverything() {
-        var saved: [URL] = [], errors: [String] = []
+        var saved: [URL] = [], ready: [Page] = [], errors: [String] = []
         for d in docs {
-            do { _ = try write(d); saved.append(d.dest) } catch let e as Fail { errors.append(e.msg) } catch {
-                errors.append("\(error)")
-            }
+            do {
+                let p = try preparePage(d.view.img, crop: d.view.crop, d.view.opts)
+                print(try writePage(p, to: d.dest))
+                saved.append(d.dest); ready.append(p)
+            } catch let e as Fail { errors.append(e.msg) } catch { errors.append("\(error)") }
         }
-        updateStatus(errors.isEmpty ? "saved \(saved.count) PDFs" : "saved \(saved.count); error: " + errors.joined(separator: "; "))
+        var note = "saved \(saved.count) PDFs"
+        if combine.state == .on && ready.count > 1, let first = saved.first {
+            let dest = combinedDest(near: first)
+            do {
+                print(try writeCombined(ready, to: dest))
+                saved.insert(dest, at: 0)
+                note += " + \(dest.lastPathComponent)"
+            } catch let e as Fail { errors.append(e.msg) } catch { errors.append("\(error)") }
+        }
+        updateStatus(errors.isEmpty ? note : note + "; error: " + errors.joined(separator: "; "))
         if !saved.isEmpty { reveal(saved) }
     }
+    @objc func combineChanged(_ s: NSButton) { prefs.set(s.state == .on, forKey: combineKey) }
 }
 
 // Remembered UI choices. The CLI flag, when given, wins for that launch.
 let prefs = UserDefaults(suiteName: "com.github.tbaums.gridify") ?? .standard
 let capKey = "maxTwoMB"
+let combineKey = "combineAll"
 
 func runUI(_ paths: [String], _ o: Opts, out: URL?, capFlag: Bool?) -> Never {
     let app = NSApplication.shared
@@ -827,6 +874,7 @@ var out: String?
 var o = Opts()
 var ui = false
 var capFlag: Bool?
+var combineFlag = false
 
 var argv = CommandLine.arguments.dropFirst().makeIterator()
 func str(_ flag: String) -> String {
@@ -856,6 +904,7 @@ while let a = argv.next() {
     case "--rotate": o.rotate = num(a)
     case "--max-2mb": capFlag = true; o.maxBytes = sizeCap
     case "--no-max-2mb": capFlag = false; o.maxBytes = 0
+    case "--combine": combineFlag = true
     case "--no-auto": o.adjust.auto = false
     case "--gray": o.adjust.gray = true
     case "--steps": o.adjust.steps = Int(num(a))
@@ -883,6 +932,7 @@ if ![aj.brightness, aj.contrast].allSatisfy({ (-1...1).contains($0) })
 
 if ui { runUI(images, o, out: out.map { URL(fileURLWithPath: $0) }, capFlag: capFlag) }
 
+var ready: [Page] = [], firstDest: URL?
 for p in images {
     do {
         let img = rotated(try loadOriented(p), o.rotate)
@@ -892,10 +942,16 @@ for p in images {
         print(String(format: "cropped: %.0fx%.0f px -> %.3gx%.3g in (%.0f px/in)",
                      r.width, r.height, o.width, o.height, ppi))
         if ppi < softPPI { print("warning: source is low-res for this print size; expect softness") }
-        print(try render(img, crop: r, o, to: out.map { URL(fileURLWithPath: $0) } ?? defaultDest(p)))
+        let dest = out.map { URL(fileURLWithPath: $0) } ?? defaultDest(p)
+        let page = try preparePage(img, crop: r, o)
+        print(try writePage(page, to: dest))
+        if combineFlag { ready.append(page); firstDest = firstDest ?? dest }
     } catch let e as Fail {
         die(e.msg)
     } catch {
         die("\(error)")
     }
+}
+if combineFlag, ready.count > 1, let first = firstDest {
+    do { print(try writeCombined(ready, to: combinedDest(near: first))) } catch let e as Fail { die(e.msg) }
 }
