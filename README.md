@@ -59,7 +59,9 @@ In the `--ui` window:
   or less: JPEG quality first, then resolution. The grid stays sharp vector.
 - Choose the cell size, page size and labels; **Save PDF** (Return or ⌘S)
   writes the current image's PDF and opens it in Preview. **Save All** (⌥⌘S)
-  writes every open image and shows the PDFs in Finder.
+  writes every open image and shows the PDFs in Finder. With **Combine**
+  ticked (the default, remembered), it also writes `gridify_<date-time>.pdf` with
+  every image on its own page, for printing in one go.
 
 Options:
 
@@ -72,6 +74,7 @@ Options:
 | `--rotate DEG` | 0 | rotate clockwise before cropping |
 | `--page letter\|a4` | letter | page size |
 | `--labels` | off | label columns A… and rows 1… |
+| `--combine` | off | with several images, also write one combined PDF |
 | `--no-max-2mb` | capped | allow PDFs over 2 MB (`--max-2mb` caps) |
 | `--no-auto` | auto on | skip auto-contrast |
 | `--gray` | off | black and white |
