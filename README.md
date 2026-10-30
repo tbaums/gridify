@@ -46,6 +46,8 @@ In the `--ui` window:
 - Drag (or use the arrow keys) to move the crop.
 - Scroll, pinch or press `+`/`-` to zoom; **Fit** resets.
 - Use the rotate buttons for 90° turns and the slider to straighten (±45°).
+- **≤ 2 MB** (on by default, remembered) shrinks the photo so each PDF is 2 MB
+  or less: JPEG quality first, then resolution. The grid stays sharp vector.
 - Choose the cell size, page size and labels; **Save PDF** (Return or ⌘S)
   writes the current image's PDF and opens it in Preview. **Save All** (⌥⌘S)
   writes every open image and shows the PDFs in Finder.
@@ -61,9 +63,11 @@ Options:
 | `--rotate DEG` | 0 | rotate clockwise before cropping |
 | `--page letter\|a4` | letter | page size |
 | `--labels` | off | label columns A… and rows 1… |
+| `--no-max-2mb` | capped | allow PDFs over 2 MB (`--max-2mb` caps) |
 
-The output prints the effective resolution, and gridify warns when the photo is
-below 180 px per inch at the chosen print size.
+The output prints the PDF size and effective resolution, and gridify warns when
+the photo is below 100 px per inch at the chosen print size. That's plenty for a
+pencil-sketch reference.
 
 ## Printing
 

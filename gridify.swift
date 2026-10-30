@@ -23,6 +23,8 @@ usage: gridify IMAGE... [options]
   --page letter|a4   page size (default letter)
   --labels           label columns A.. and rows 1..
   --rotate DEG       rotate the image clockwise before cropping (any angle)
+  --no-max-2mb       don't cap the PDF size (default: shrink the photo so
+                     each PDF is 2 MB or less; --max-2mb turns it back on)
 """
 
 func die(_ msg: String) -> Never {
@@ -36,7 +38,11 @@ struct Opts {
     var width = 5.0, height = 7.0, cell = 1.0, fx = 0.5, fy = 0.5
     var page = "letter", labels = false
     var rotate = 0.0  // degrees clockwise
+    var maxBytes = sizeCap  // 0 = no cap
 }
+
+let sizeCap = 2_000_000  // "2 MB", decimal, as Finder reports it
+let softPPI = 100.0  // below this a pencil-sketch reference starts to look soft
 
 let pages: [String: (Double, Double)] = ["letter": (8.5, 11.0), "a4": (8.27, 11.69)]
 let icloud = FileManager.default.homeDirectoryForCurrentUser
@@ -99,17 +105,67 @@ func defaultDest(_ path: String) -> URL {
     return icloud.appendingPathComponent("\(stem)_grid.pdf")
 }
 
+// Resample to w x h on an opaque white RGB canvas.
+func scaled(_ img: CGImage, _ w: Int, _ h: Int) -> CGImage? {
+    guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+    ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+    ctx.interpolationQuality = .high
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return ctx.makeImage()
+}
+
+// JPEG-backed image: Quartz embeds its JPEG bytes in the PDF as-is (DCTDecode).
+func jpegBacked(_ img: CGImage, quality: Double) -> CGImage? {
+    let data = NSMutableData()
+    guard let dst = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(dst, img, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+    guard CGImageDestinationFinalize(dst), let provider = CGDataProvider(data: data) else { return nil }
+    return CGImage(jpegDataProviderSource: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+}
+
+// Under the cap: lower JPEG quality first, then resolution, until the PDF fits.
+// Returns the PDF and the effective resolution of the embedded photo.
+func fittedPDF(_ cropped: CGImage, _ o: Opts) throws -> (Data, Double) {
+    var w = Double(cropped.width), h = Double(cropped.height)
+    while true {
+        guard let base = scaled(cropped, Int(w), Int(h)) else { throw Fail(msg: "resample failed") }
+        for q in [0.9, 0.8, 0.7, 0.6] {
+            guard let jpg = jpegBacked(base, quality: q) else { throw Fail(msg: "JPEG encode failed") }
+            let data = try pdfData(jpg, o)
+            if data.count <= o.maxBytes || w < 100 { return (data, w / o.width) }
+        }
+        w *= 0.8; h *= 0.8
+    }
+}
+
 func render(_ img: CGImage, crop: CGRect, _ o: Opts, to dest: URL) throws -> String {
     guard let (pw, ph) = pages[o.page] else { throw Fail(msg: "--page must be letter or a4") }
     if o.width > pw - 1 || o.height > ph - 1 {
         throw Fail(msg: "\(o.width)x\(o.height) in does not fit on \(o.page) with 0.5 in margins")
     }
     guard let cropped = img.cropping(to: crop.integral) else { throw Fail(msg: "crop failed") }
+    let (data, ppi) = o.maxBytes > 0
+        ? try fittedPDF(cropped, o)
+        : (try pdfData(cropped, o), Double(cropped.width) / o.width)
+    do { try data.write(to: dest, options: .atomic) } catch { throw Fail(msg: "cannot write \(dest.path)") }
+    let cols = gridPositions(o.width, o.cell).count + 1, rows = gridPositions(o.height, o.cell).count + 1
+    let size = String(format: "%.2f MB, %.0f px/in", Double(data.count) / 1e6, ppi)
+    let warn = ppi < softPPI ? " — low-res, expect softness" : ""
+    return "saved: \(dest.path)  (\(cols) columns x \(rows) rows; \(size)\(warn))"
+}
 
+// The page: photo, vector grid, labels and margin ticks, as PDF bytes.
+func pdfData(_ cropped: CGImage, _ o: Opts) throws -> Data {
+    let (pw, ph) = pages[o.page]!
     // PDF space: 72 pt/in, origin bottom-left.
     var media = CGRect(x: 0, y: 0, width: pw * 72, height: ph * 72)
-    guard let ctx = CGContext(dest as CFURL, mediaBox: &media, nil) else {
-        throw Fail(msg: "cannot write \(dest.path)")
+    let out = NSMutableData()
+    guard let consumer = CGDataConsumer(data: out),
+          let ctx = CGContext(consumer: consumer, mediaBox: &media, nil) else {
+        throw Fail(msg: "cannot create PDF")
     }
     let W = o.width * 72, H = o.height * 72
     let ox = (media.width - W) / 2, oy = (media.height - H) / 2
@@ -168,7 +224,7 @@ func render(_ img: CGImage, crop: CGRect, _ o: Opts, to dest: URL) throws -> Str
     }
     ctx.endPDFPage()
     ctx.closePDF()
-    return "saved: \(dest.path)  (\(xs.count + 1) columns x \(ys.count + 1) rows)"
+    return out as Data
 }
 
 // MARK: - UI
@@ -368,6 +424,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         page.selectItem(withTitle: opts.page)
         let labels = NSButton(checkboxWithTitle: "Labels", target: self, action: #selector(labelsChanged))
         labels.state = opts.labels ? .on : .off
+        let cap = NSButton(checkboxWithTitle: "≤ 2 MB", target: self, action: #selector(capChanged))
+        cap.state = opts.maxBytes > 0 ? .on : .off
+        cap.toolTip = "shrink the photo (JPEG quality, then resolution) so each PDF is 2 MB or less"
         let reset = NSButton(title: "Fit", target: self, action: #selector(resetZoom))
         fine.minValue = -45; fine.maxValue = 45
         fine.isContinuous = true
@@ -380,7 +439,7 @@ final class Controller: NSObject, NSApplicationDelegate {
                           target: self, action: #selector(turnRight))
         ccw.toolTip = "rotate 90° left"; cw.toolTip = "rotate 90° right"
         rotateControls = [reset, ccw, cw, fine]
-        let bottom = NSStackView(views: [cell, page, labels, reset, ccw, cw, fine])
+        let bottom = NSStackView(views: [cell, page, labels, cap, reset, ccw, cw, fine])
         for bar in [top, bottom] {
             bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
             bar.setHuggingPriority(.defaultLow, for: .horizontal)
@@ -448,6 +507,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         current = i
         let v = docs[i].view
         v.opts.cell = opts.cell; v.opts.page = opts.page; v.opts.labels = opts.labels
+        v.opts.maxBytes = opts.maxBytes
         showContent(v)
         v.translatesAutoresizingMaskIntoConstraints = false
         v.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
@@ -476,7 +536,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     func updateStatus(_ prefix: String = "") {
         guard let v = view else { status.stringValue = prefix; return }
         let ppi = v.crop.width / v.opts.width
-        let warn = ppi < 180 ? " — low-res, expect softness" : ""
+        let warn = ppi < softPPI ? " — low-res, expect softness" : ""
         status.stringValue = prefix.isEmpty
             ? String(format: "%.1f° · %.0f px/in%@", v.opts.rotate, ppi, warn)
             : prefix
@@ -528,6 +588,11 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
     @objc func pageChanged(_ s: NSPopUpButton) { let p = s.titleOfSelectedItem ?? "letter"; setShared { $0.page = p } }
     @objc func labelsChanged(_ s: NSButton) { let on = s.state == .on; setShared { $0.labels = on } }
+    @objc func capChanged(_ s: NSButton) {
+        let on = s.state == .on
+        prefs.set(on, forKey: capKey)
+        setShared { $0.maxBytes = on ? sizeCap : 0 }
+    }
     @objc func resetZoom() { view?.setZoom(1) }
 
     func write(_ d: Doc) throws -> String {
@@ -556,8 +621,15 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 }
 
-func runUI(_ paths: [String], _ o: Opts, out: URL?) -> Never {
+// Remembered UI choices. The CLI flag, when given, wins for that launch.
+let prefs = UserDefaults(suiteName: "com.github.tbaums.gridify") ?? .standard
+let capKey = "maxTwoMB"
+
+func runUI(_ paths: [String], _ o: Opts, out: URL?, capFlag: Bool?) -> Never {
     let app = NSApplication.shared
+    var o = o
+    let capOn = capFlag ?? (prefs.object(forKey: capKey) as? Bool ?? true)
+    o.maxBytes = capOn ? sizeCap : 0
     let controller = Controller(paths: paths, opts: o, out: out)
     app.delegate = controller
     let menu = NSMenu()
@@ -593,6 +665,7 @@ var images: [String] = []
 var out: String?
 var o = Opts()
 var ui = false
+var capFlag: Bool?
 
 var argv = CommandLine.arguments.dropFirst().makeIterator()
 func str(_ flag: String) -> String {
@@ -620,6 +693,8 @@ while let a = argv.next() {
     case "--page": o.page = str(a)
     case "--labels": o.labels = true
     case "--rotate": o.rotate = num(a)
+    case "--max-2mb": capFlag = true; o.maxBytes = sizeCap
+    case "--no-max-2mb": capFlag = false; o.maxBytes = 0
     default:
         if a.hasPrefix("-") { die("unknown option \(a)\n\n\(usage)") }
         images.append(a)
@@ -632,7 +707,7 @@ if o.width <= 0 || o.height <= 0 || o.cell <= 0 || !(0...1).contains(o.fx) || !(
 }
 if pages[o.page] == nil { die("--page must be letter or a4") }
 
-if ui { runUI(images, o, out: out.map { URL(fileURLWithPath: $0) }) }
+if ui { runUI(images, o, out: out.map { URL(fileURLWithPath: $0) }, capFlag: capFlag) }
 
 for p in images {
     do {
@@ -642,7 +717,7 @@ for p in images {
         let ppi = r.width / o.width
         print(String(format: "cropped: %.0fx%.0f px -> %.3gx%.3g in (%.0f px/in)",
                      r.width, r.height, o.width, o.height, ppi))
-        if ppi < 180 { print("warning: source is low-res for this print size; expect softness") }
+        if ppi < softPPI { print("warning: source is low-res for this print size; expect softness") }
         print(try render(img, crop: r, o, to: out.map { URL(fileURLWithPath: $0) } ?? defaultDest(p)))
     } catch let e as Fail {
         die(e.msg)
