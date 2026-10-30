@@ -4,6 +4,7 @@
 // Build: swiftc -O gridify.swift -o ~/.local/bin/gridify
 import AppKit
 import CoreGraphics
+import CoreImage
 import CoreText
 import Foundation
 import ImageIO
@@ -25,6 +26,14 @@ usage: gridify IMAGE... [options]
   --rotate DEG       rotate the image clockwise before cropping (any angle)
   --no-max-2mb       don't cap the PDF size (default: shrink the photo so
                      each PDF is 2 MB or less; --max-2mb turns it back on)
+ drawing adjustments (auto-contrast is on unless --no-auto):
+  --no-auto          don't auto-stretch tones / lift dark images
+  --gray             black and white
+  --steps 3|4|5      simplify to N flat tones (a value map; implies --gray)
+  --brightness X     -1..1 (default 0)
+  --contrast X       -1..1 (default 0)
+  --shadows X        0..1, lift dark areas (default 0)
+  --highlights X     0..1, recover bright areas (default 0)
 """
 
 func die(_ msg: String) -> Never {
@@ -39,6 +48,15 @@ struct Opts {
     var page = "letter", labels = false
     var rotate = 0.0  // degrees clockwise
     var maxBytes = sizeCap  // 0 = no cap
+    var adjust = Adjust()  // per image
+}
+
+// Tone adjustments that make a photo easier to sketch from.
+struct Adjust: Equatable {
+    var auto = true, gray = false
+    var steps = 0  // 0 = off, else 3...5 flat tones
+    var brightness = 0.0, contrast = 0.0  // -1...1
+    var shadows = 0.0, highlights = 0.0  // 0...1
 }
 
 let sizeCap = 2_000_000  // "2 MB", decimal, as Finder reports it
@@ -100,6 +118,68 @@ func cropRect(_ w: Double, _ h: Double, ratio: Double, fx: Double, fy: Double, z
     return CGRect(x: (w - cw) * fx, y: (h - ch) * fy, width: cw, height: ch)
 }
 
+// Auto-contrast parameters for a whole image: the 0.5% / 99.5% luminance
+// points become black and white, and a dark image's midtones are lifted
+// (gamma < 1) so the median lands near middle grey. Never darkens.
+struct Levels { var lo = 0.0, hi = 1.0, gamma = 1.0 }
+
+func autoLevels(_ img: CGImage) -> Levels {
+    let n = 256.0, s = min(1, n / Double(max(img.width, img.height)))
+    let w = max(1, Int(Double(img.width) * s)), h = max(1, Int(Double(img.height) * s))
+    var px = [UInt8](repeating: 0, count: w * h)
+    guard let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                              space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+    else { return Levels() }
+    ctx.interpolationQuality = .medium
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    var hist = [Int](repeating: 0, count: 256)
+    for p in px { hist[Int(p)] += 1 }
+    func pct(_ f: Double) -> Double {
+        let target = Int(f * Double(px.count)); var acc = 0
+        for (v, c) in hist.enumerated() { acc += c; if acc > target { return Double(v) / 255 } }
+        return 1
+    }
+    var lo = pct(0.005), hi = pct(0.995)
+    if hi - lo < 0.1 { lo = 0; hi = 1 }  // flat image: leave it alone
+    let mid = min(max((pct(0.5) - lo) / (hi - lo), 0.01), 0.99)
+    let gamma = mid < 0.45 ? min(max(log(0.5) / log(mid), 0.5), 1) : 1
+    return Levels(lo: lo, hi: hi, gamma: gamma)
+}
+
+let ciContext = CIContext(options: [.workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+
+// Apply the adjustments (auto levels from the whole image, so the preview and
+// the PDF match). Works in sRGB so steps and gamma are perceptual.
+func adjusted(_ img: CGImage, _ a: Adjust, _ lv: Levels) -> CGImage {
+    if a == Adjust(auto: false) { return img }
+    var x = CIImage(cgImage: img)
+    if a.auto {
+        let s = 1 / (lv.hi - lv.lo), b = -lv.lo * s
+        x = x.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: s, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: s, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: s, w: 0), "inputBiasVector": CIVector(x: b, y: b, z: b, w: 0),
+        ]).applyingFilter("CIColorClamp")
+        if lv.gamma < 1 { x = x.applyingFilter("CIGammaAdjust", parameters: ["inputPower": lv.gamma]) }
+    }
+    if a.shadows != 0 || a.highlights != 0 {
+        x = x.applyingFilter("CIHighlightShadowAdjust", parameters: [
+            "inputShadowAmount": a.shadows, "inputHighlightAmount": 1 - a.highlights, "inputRadius": 0,
+        ])
+    }
+    let mono = a.gray || a.steps > 0
+    if a.brightness != 0 || a.contrast != 0 || mono {
+        x = x.applyingFilter("CIColorControls", parameters: [
+            kCIInputBrightnessKey: a.brightness * 0.3, kCIInputContrastKey: 1 + a.contrast * 0.6,
+            kCIInputSaturationKey: mono ? 0 : 1,
+        ])
+    }
+    if a.steps > 0 { x = x.applyingFilter("CIColorPosterize", parameters: ["inputLevels": a.steps]) }
+    let r = CGRect(x: 0, y: 0, width: img.width, height: img.height)
+    return ciContext.createCGImage(x.cropped(to: r), from: r, format: .RGBA8,
+                                   colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!) ?? img
+}
+
 func defaultDest(_ path: String) -> URL {
     let stem = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
     return icloud.appendingPathComponent("\(stem)_grid.pdf")
@@ -146,7 +226,8 @@ func render(_ img: CGImage, crop: CGRect, _ o: Opts, to dest: URL) throws -> Str
     if o.width > pw - 1 || o.height > ph - 1 {
         throw Fail(msg: "\(o.width)x\(o.height) in does not fit on \(o.page) with 0.5 in margins")
     }
-    guard let cropped = img.cropping(to: crop.integral) else { throw Fail(msg: "crop failed") }
+    guard let raw = img.cropping(to: crop.integral) else { throw Fail(msg: "crop failed") }
+    let cropped = adjusted(raw, o.adjust, autoLevels(img))
     let (data, ppi) = o.maxBytes > 0
         ? try fittedPDF(cropped, o)
         : (try pdfData(cropped, o), Double(cropped.width) / o.width)
@@ -239,22 +320,44 @@ final class CropView: NSView {
     var onChange: () -> Void = {}
     private var last = CGPoint.zero
 
+    var preview: CGImage  // img downscaled for fast adjustment previews
+    var levels = Levels()  // auto-contrast parameters for img
+
     init(img: CGImage, opts: Opts) {
         base = img
         self.img = rotated(img, opts.rotate)
         self.opts = opts
+        preview = self.img
         nsimg = NSImage(cgImage: self.img, size: NSSize(width: self.img.width, height: self.img.height))
         crop = cropRect(Double(self.img.width), Double(self.img.height), ratio: opts.width / opts.height,
                         fx: opts.fx, fy: opts.fy)
         super.init(frame: .zero)
+        imageChanged()
     }
+
+    // img changed (load, rotation): rebuild the preview copy and auto levels.
+    private func imageChanged() {
+        let s = min(1, 1600 / Double(max(img.width, img.height)))
+        preview = s < 1 ? (scaled(img, Int(Double(img.width) * s), Int(Double(img.height) * s)) ?? img) : img
+        levels = autoLevels(img)
+        refreshPreview()
+    }
+
+    // Redraw the on-screen image with the current adjustments.
+    func refreshPreview() {
+        let shown = adjusted(preview, opts.adjust, levels)
+        nsimg = NSImage(cgImage: shown, size: NSSize(width: img.width, height: img.height))
+        needsDisplay = true
+    }
+
+    func setAdjust(_ a: Adjust) { opts.adjust = a; refreshPreview() }
 
     // Re-rotate from the original, keeping the crop's zoom and relative center.
     func setRotation(_ deg: Double) {
         let rx = crop.midX / Double(img.width), ry = crop.midY / Double(img.height)
         opts.rotate = deg
         img = rotated(base, deg)
-        nsimg = NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
+        imageChanged()
         let full = cropRect(Double(img.width), Double(img.height), ratio: opts.width / opts.height,
                             fx: 0, fy: 0, zoom: zoom)
         crop = CGRect(x: rx * Double(img.width) - full.width / 2, y: ry * Double(img.height) - full.height / 2,
@@ -386,6 +489,15 @@ final class Controller: NSObject, NSApplicationDelegate {
     let fine = NSSlider()
     var quarter = 0.0  // 90° turns; total rotation = quarter * 90 + fine
     var rotateControls: [NSControl] = []
+    // Drawing adjustments (per image).
+    let autoBox = NSButton(checkboxWithTitle: "Auto", target: nil, action: nil)
+    let grayBox = NSButton(checkboxWithTitle: "B&W", target: nil, action: nil)
+    let stepsBox = NSButton(checkboxWithTitle: "Steps", target: nil, action: nil)
+    let stepsPop = NSPopUpButton()
+    let sliders: [(name: String, key: WritableKeyPath<Adjust, Double>, min: Double, slider: NSSlider)] = [
+        ("Bright", \.brightness, -1, NSSlider()), ("Contrast", \.contrast, -1, NSSlider()),
+        ("Shadows", \.shadows, 0, NSSlider()), ("Highlights", \.highlights, 0, NSSlider()),
+    ]
 
     init(paths: [String], opts: Opts, out: URL?) {
         self.paths = paths
@@ -438,9 +550,31 @@ final class Controller: NSObject, NSApplicationDelegate {
         let cw = NSButton(image: NSImage(systemSymbolName: "rotate.right", accessibilityDescription: "Rotate right")!,
                           target: self, action: #selector(turnRight))
         ccw.toolTip = "rotate 90° left"; cw.toolTip = "rotate 90° right"
-        rotateControls = [reset, ccw, cw, fine]
         let bottom = NSStackView(views: [cell, page, labels, cap, reset, ccw, cw, fine])
-        for bar in [top, bottom] {
+
+        for b in [autoBox, grayBox, stepsBox] { b.target = self; b.action = #selector(adjustChanged) }
+        autoBox.toolTip = "stretch darks and lights to the full range; lift a dark image's midtones"
+        grayBox.toolTip = "black and white"
+        stepsBox.toolTip = "simplify to a few flat tones (a value map)"
+        stepsPop.addItems(withTitles: ["3", "4", "5"]); stepsPop.selectItem(withTitle: "4")
+        stepsPop.target = self; stepsPop.action = #selector(adjustChanged)
+        var adjustViews: [NSView] = [autoBox, grayBox, stepsBox, stepsPop]
+        for s in sliders {
+            s.slider.minValue = s.min; s.slider.maxValue = 1; s.slider.isContinuous = true
+            s.slider.target = self; s.slider.action = #selector(adjustChanged)
+            s.slider.widthAnchor.constraint(equalToConstant: 70).isActive = true
+            s.slider.toolTip = s.name.lowercased()
+            let label = NSTextField(labelWithString: s.name)
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            adjustViews += [label, s.slider]
+        }
+        let resetAdjust = NSButton(title: "Reset", target: self, action: #selector(resetAdjust))
+        resetAdjust.toolTip = "back to the defaults (Auto on, everything else off)"
+        adjustViews.append(resetAdjust)
+        let adjustBar = NSStackView(views: adjustViews)
+        rotateControls = [reset, ccw, cw, fine, autoBox, grayBox, stepsBox, stepsPop, resetAdjust]
+            + sliders.map(\.slider)
+        for bar in [top, bottom, adjustBar] {
             bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
             bar.setHuggingPriority(.defaultLow, for: .horizontal)
         }
@@ -452,7 +586,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         placeholder.centerXAnchor.constraint(equalTo: empty.centerXAnchor).isActive = true
         placeholder.centerYAnchor.constraint(equalTo: empty.centerYAnchor).isActive = true
         empty.setContentHuggingPriority(.defaultLow, for: .vertical)
-        root = NSStackView(views: [top, empty, bottom])
+        root = NSStackView(views: [top, empty, bottom, adjustBar])
         root.orientation = .vertical
         root.spacing = 0
 
@@ -514,6 +648,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         v.setContentHuggingPriority(.defaultLow, for: .vertical)
         quarter = (v.opts.rotate / 90).rounded()
         fine.doubleValue = v.opts.rotate - quarter * 90
+        showAdjust(v.opts.adjust)
         window.makeFirstResponder(v)
         v.needsDisplay = true
         refresh()
@@ -594,6 +729,32 @@ final class Controller: NSObject, NSApplicationDelegate {
         setShared { $0.maxBytes = on ? sizeCap : 0 }
     }
     @objc func resetZoom() { view?.setZoom(1) }
+
+    // Per-image adjustments: controls mirror the current image's settings.
+    func showAdjust(_ a: Adjust) {
+        autoBox.state = a.auto ? .on : .off
+        grayBox.state = a.gray || a.steps > 0 ? .on : .off  // see adjustChanged
+        grayBox.isEnabled = a.steps == 0
+        stepsBox.state = a.steps > 0 ? .on : .off
+        if a.steps > 0 { stepsPop.selectItem(withTitle: "\(a.steps)") }
+        for s in sliders { s.slider.doubleValue = a[keyPath: s.key] }
+    }
+    @objc func adjustChanged() {
+        guard let v = view else { return }
+        var a = v.opts.adjust
+        a.auto = autoBox.state == .on
+        // B&W is forced (and its box disabled) while Steps is on; keep the
+        // user's own B&W choice for when Steps goes off again.
+        if a.steps == 0 { a.gray = grayBox.state == .on }
+        a.steps = stepsBox.state == .on ? Int(stepsPop.titleOfSelectedItem ?? "4") ?? 4 : 0
+        for s in sliders { a[keyPath: s.key] = (s.slider.doubleValue * 100).rounded() / 100 }
+        v.setAdjust(a)
+        showAdjust(a)
+    }
+    @objc func resetAdjust() {
+        view?.setAdjust(Adjust())
+        showAdjust(Adjust())
+    }
 
     func write(_ d: Doc) throws -> String {
         let msg = try render(d.view.img, crop: d.view.crop, d.view.opts, to: d.dest)
@@ -695,6 +856,13 @@ while let a = argv.next() {
     case "--rotate": o.rotate = num(a)
     case "--max-2mb": capFlag = true; o.maxBytes = sizeCap
     case "--no-max-2mb": capFlag = false; o.maxBytes = 0
+    case "--no-auto": o.adjust.auto = false
+    case "--gray": o.adjust.gray = true
+    case "--steps": o.adjust.steps = Int(num(a))
+    case "--brightness": o.adjust.brightness = num(a)
+    case "--contrast": o.adjust.contrast = num(a)
+    case "--shadows": o.adjust.shadows = num(a)
+    case "--highlights": o.adjust.highlights = num(a)
     default:
         if a.hasPrefix("-") { die("unknown option \(a)\n\n\(usage)") }
         images.append(a)
@@ -706,6 +874,12 @@ if o.width <= 0 || o.height <= 0 || o.cell <= 0 || !(0...1).contains(o.fx) || !(
     die("sizes must be > 0 and --focus-x/-y within 0..1")
 }
 if pages[o.page] == nil { die("--page must be letter or a4") }
+let aj = o.adjust
+if ![0, 3, 4, 5].contains(aj.steps) { die("--steps must be 3, 4 or 5") }
+if ![aj.brightness, aj.contrast].allSatisfy({ (-1...1).contains($0) })
+    || ![aj.shadows, aj.highlights].allSatisfy({ (0...1).contains($0) }) {
+    die("--brightness/--contrast must be within -1..1, --shadows/--highlights within 0..1")
+}
 
 if ui { runUI(images, o, out: out.map { URL(fileURLWithPath: $0) }, capFlag: capFlag) }
 
